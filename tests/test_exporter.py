@@ -75,6 +75,55 @@ class ExporterTests(unittest.TestCase):
         connection.on_message(client, None, Mock(payload=b'\xff'))
         self.assertEqual(connection.message_queue.get_nowait(), b'\xff')
 
+    def test_quota_keepalive_disabled_by_default(self):
+        # Without user_id / QUOTA_REQUEST_INTERVAL the client only ever
+        # subscribes to the regular property topic, same as before this feature.
+        with patch.object(exporter.mqtt.Client, 'connect'), patch.object(exporter.mqtt.Client, 'loop_start'):
+            connection = exporter.EcoflowMQTT(Queue(), 'sn', 'user', 'password', 'localhost', 8883, 'client-id')
+        self.assertIsNone(connection.get_topic)
+        client = Mock()
+        client.subscribe.return_value = (exporter.mqtt.MQTT_ERR_SUCCESS, 1)
+        ok = ReasonCode(PacketTypes.CONNACK, 'Success')
+        connection.on_connect(client, None, None, ok, None)
+        self.assertEqual(client.subscribe.call_count, 1)
+        client.publish.assert_not_called()
+
+    def test_quota_keepalive_requests_latest_quotas_snapshot(self):
+        with patch.object(exporter.mqtt.Client, 'connect'), patch.object(exporter.mqtt.Client, 'loop_start'):
+            connection = exporter.EcoflowMQTT(Queue(), 'sn', 'user', 'password', 'localhost', 8883, 'client-id',
+                                               user_id='42', quota_request_interval=30)
+        self.assertEqual(connection.get_topic, '/app/42/sn/thing/property/get')
+        self.assertEqual(connection.get_reply_topic, '/app/42/sn/thing/property/get_reply')
+
+        client = Mock()
+        client.subscribe.return_value = (exporter.mqtt.MQTT_ERR_SUCCESS, 1)
+        ok = ReasonCode(PacketTypes.CONNACK, 'Success')
+
+        # The "get" request is published via connection.client (the long-lived
+        # MQTT client), not the `client` argument on_connect receives, because
+        # the periodic Timer callback runs outside any paho callback context.
+        with patch.object(connection.client, 'publish', return_value=(exporter.mqtt.MQTT_ERR_SUCCESS, 1)) as publish, \
+             patch.object(exporter.threading, 'Timer') as timer:
+            connection.on_connect(client, None, None, ok, None)
+
+        # Regular property topic + get_reply topic.
+        self.assertEqual(client.subscribe.call_count, 2)
+        client.subscribe.assert_any_call(connection.get_reply_topic)
+
+        publish.assert_called_once()
+        topic, payload = publish.call_args[0][:2]
+        self.assertEqual(topic, connection.get_topic)
+        self.assertEqual(json.loads(payload), {
+            'version': '1.1', 'moduleType': 0, 'operateType': 'latestQuotas', 'params': {},
+        })
+        timer.assert_called_once_with(30, connection._schedule_quota_request)
+
+    def test_quota_keepalive_reply_is_processed_like_a_normal_message(self):
+        # get_reply arrives on the same client/queue as the regular property
+        # topic, so no special-casing is needed on the Worker side.
+        self.worker.process_message(json.dumps({'params': {'bmsMaster.soc': 87}}))
+        self.assertEqual(self.metric('bms_master_soc'), 87)
+
     def test_auth_errors_do_not_expose_response_body(self):
         auth = exporter.EcoflowAuthentication.__new__(exporter.EcoflowAuthentication)
         for response in (Mock(status_code=500, text='SECRET'),

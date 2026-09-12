@@ -16,5 +16,6 @@ services:
       EXPORTER_PORT: "9090"
       DEVICE_MODEL: "${DEVICE_MODEL:-delta3_plus}"
       OFFLINE_TIMEOUT: "${OFFLINE_TIMEOUT:-120}"
+      QUOTA_REQUEST_INTERVAL: "${QUOTA_REQUEST_INTERVAL:-0}"
     logging:
       driver: local

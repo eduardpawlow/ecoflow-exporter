@@ -1,5 +1,6 @@
 # Based on vbash/ecoflow_exporter (GPL-3.0).
 # Modified 2026-09-13: Paho callback API v2 and resilient payload processing.
+# Modified 2026-09-13: optional periodic "latestQuotas" MQTT keepalive request (experimental).
 import logging as log
 import sys
 import os
@@ -8,6 +9,7 @@ import time
 import json
 import re
 import math
+import threading
 import requests
 import base64
 import uuid
@@ -31,6 +33,7 @@ class EcoflowAuthentication:
         self.mqtt_username = None
         self.mqtt_password = None
         self.mqtt_client_id = None
+        self.user_id = None
         self.authorize()
 
     def authorize(self):
@@ -52,6 +55,7 @@ class EcoflowAuthentication:
         except KeyError as key:
             raise RuntimeError(f"Login response is missing {key}") from None
 
+        self.user_id = user_id
         log.info(f"Successfully logged in: {user_name}")
 
         url = "https://api.ecoflow.com/iot-auth/app/certification"
@@ -92,14 +96,24 @@ class EcoflowAuthentication:
 
 class EcoflowMQTT():
 
-    def __init__(self, message_queue, device_sn, username, password, addr, port, client_id):
+    def __init__(self, message_queue, device_sn, username, password, addr, port, client_id,
+                 user_id=None, quota_request_interval=0):
         self.message_queue = message_queue
         self.addr = addr
         self.port = port
         self.username = username
         self.password = password
         self.client_id = client_id
+        self.device_sn = device_sn
         self.topic = f"/app/device/property/{device_sn}"
+
+        # Experimental: periodically ask the device for a full property snapshot,
+        # the same way the EcoFlow app appears to do. See README ("MQTT keepalive
+        # experiment") for why this exists and why it is not guaranteed to help.
+        self.quota_request_interval = quota_request_interval
+        self.get_topic = f"/app/{user_id}/{device_sn}/thing/property/get" if user_id else None
+        self.get_reply_topic = f"/app/{user_id}/{device_sn}/thing/property/get_reply" if user_id else None
+        self._quota_timer = None
 
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self.client_id)
         self.client.username_pw_set(self.username, self.password)
@@ -124,6 +138,37 @@ class EcoflowMQTT():
         else:
             log.info("Requested subscription to MQTT topic %s", self.topic)
 
+        if self.get_reply_topic and self.quota_request_interval > 0:
+            result, _ = client.subscribe(self.get_reply_topic)
+            if result != mqtt.MQTT_ERR_SUCCESS:
+                log.error("Failed to subscribe to MQTT topic %s: %s", self.get_reply_topic, result)
+            else:
+                log.info("Requested subscription to MQTT topic %s", self.get_reply_topic)
+            self._schedule_quota_request()
+
+    def _schedule_quota_request(self):
+        # Re-arms itself every quota_request_interval seconds. Cancelling any
+        # previous timer first avoids stacking multiple chains across reconnects.
+        if self._quota_timer:
+            self._quota_timer.cancel()
+        self.request_quota()
+        self._quota_timer = threading.Timer(self.quota_request_interval, self._schedule_quota_request)
+        self._quota_timer.daemon = True
+        self._quota_timer.start()
+
+    def request_quota(self):
+        payload = json.dumps({
+            "version": "1.1",
+            "moduleType": 0,
+            "operateType": "latestQuotas",
+            "params": {},
+        })
+        result, _ = self.client.publish(self.get_topic, payload, qos=1)
+        if result != mqtt.MQTT_ERR_SUCCESS:
+            log.warning("Failed to request quota snapshot on %s: %s", self.get_topic, result)
+        else:
+            log.debug("Requested quota snapshot on %s", self.get_topic)
+
     def on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
         if reason_code.is_failure:
             log.warning("Unexpected MQTT disconnection: %s. Will auto-reconnect", reason_code)
@@ -133,6 +178,8 @@ class EcoflowMQTT():
         self.message_queue.put(message.payload)
 
     def close(self):
+        if self._quota_timer:
+            self._quota_timer.cancel()
         self.client.disconnect()
         self.client.loop_stop()
 
@@ -303,10 +350,13 @@ def main():
         exporter_port = int(os.getenv("EXPORTER_PORT", "9090"))
         collecting_interval_seconds = int(os.getenv("COLLECTING_INTERVAL", "10"))
         offline_timeout = int(os.getenv("OFFLINE_TIMEOUT", "120"))
-        if not 1 <= exporter_port <= 65535 or collecting_interval_seconds <= 0 or offline_timeout <= 0:
+        quota_request_interval = int(os.getenv("QUOTA_REQUEST_INTERVAL", "0"))
+        if (not 1 <= exporter_port <= 65535 or collecting_interval_seconds <= 0
+                or offline_timeout <= 0 or quota_request_interval < 0):
             raise ValueError
     except ValueError:
-        log.error("EXPORTER_PORT must be 1..65535 and COLLECTING_INTERVAL/OFFLINE_TIMEOUT positive integers")
+        log.error("EXPORTER_PORT must be 1..65535, COLLECTING_INTERVAL/OFFLINE_TIMEOUT positive integers, "
+                   "QUOTA_REQUEST_INTERVAL a non-negative integer")
         sys.exit(1)
 
     if (not device_sn or not ecoflow_username or not ecoflow_password):
@@ -321,7 +371,8 @@ def main():
 
     message_queue = Queue()
 
-    connection = EcoflowMQTT(message_queue, device_sn, auth.mqtt_username, auth.mqtt_password, auth.mqtt_url, auth.mqtt_port, auth.mqtt_client_id)
+    connection = EcoflowMQTT(message_queue, device_sn, auth.mqtt_username, auth.mqtt_password, auth.mqtt_url, auth.mqtt_port, auth.mqtt_client_id,
+                              user_id=auth.user_id, quota_request_interval=quota_request_interval)
 
     metrics = Worker(message_queue, device_name, collecting_interval_seconds,
                      device_model=os.getenv("DEVICE_MODEL", "json"), offline_timeout=offline_timeout)
