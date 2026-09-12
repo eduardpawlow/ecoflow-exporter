@@ -1,0 +1,18 @@
+services:
+  ecoflow-exporter:
+    build:
+      context: https://github.com/eduardpawlow/ecoflow-exporter.git#master
+      dockerfile: Dockerfile
+    image: ecoflow-exporter:local-arm64
+    pull_policy: build
+    platform: linux/arm64
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:19094:9090"
+    environment:
+      DEVICE_SN: "${DEVICE_SN:?Set DEVICE_SN in .env}"
+      ECOFLOW_USERNAME: "${ECOFLOW_USERNAME:?Set ECOFLOW_USERNAME in .env}"
+      ECOFLOW_PASSWORD: "${ECOFLOW_PASSWORD:?Set ECOFLOW_PASSWORD in .env}"
+      EXPORTER_PORT: "9090"
+    logging:
+      driver: local
