@@ -4,8 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir --no-deps setuptools==84.0.0 wheel==0.48.0 packaging==26.3 \
-    && pip install --no-cache-dir --no-build-isolation -r requirements.txt
+RUN pip install --no-cache-dir --only-binary=:all: -r requirements.txt
 COPY ecoflow_exporter.py LICENSE ./
 USER 65534:65534
 EXPOSE 9090
