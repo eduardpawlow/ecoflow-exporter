@@ -14,5 +14,7 @@ services:
       ECOFLOW_USERNAME: "${ECOFLOW_USERNAME:?Set ECOFLOW_USERNAME in .env}"
       ECOFLOW_PASSWORD: "${ECOFLOW_PASSWORD:?Set ECOFLOW_PASSWORD in .env}"
       EXPORTER_PORT: "9090"
+      DEVICE_MODEL: "${DEVICE_MODEL:-delta3_plus}"
+      OFFLINE_TIMEOUT: "${OFFLINE_TIMEOUT:-120}"
     logging:
       driver: local

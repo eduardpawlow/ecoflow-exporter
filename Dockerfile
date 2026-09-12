@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --only-binary=:all: -r requirements.txt
-COPY ecoflow_exporter.py LICENSE ./
+COPY ecoflow_exporter.py delta3_decoder.py delta3_pb2.py LICENSE THIRD_PARTY_NOTICES.md ./
 USER 65534:65534
 EXPOSE 9090
 CMD ["python", "ecoflow_exporter.py"]

@@ -13,6 +13,8 @@ import base64
 import uuid
 import paho.mqtt.client as mqtt
 from queue import Queue
+from google.protobuf.message import DecodeError
+from delta3_decoder import decode_delta3
 from prometheus_client import start_http_server, REGISTRY, Gauge, Counter
 
 
@@ -169,10 +171,13 @@ class EcoflowMetric:
 
 
 class Worker:
-    def __init__(self, message_queue, device_name, collecting_interval_seconds=10):
+    def __init__(self, message_queue, device_name, collecting_interval_seconds=10, device_model="json", offline_timeout=120):
         self.message_queue = message_queue
         self.device_name = device_name
         self.collecting_interval_seconds = collecting_interval_seconds
+        self.device_model = device_model
+        self.offline_timeout = offline_timeout
+        self.last_valid_message = None
         self.metrics_collector = []
         self.online = Gauge("ecoflow_online", "1 if device is online", labelnames=["device"])
         self.mqtt_messages_receive_total = Counter("ecoflow_mqtt_messages_receive_total", "total MQTT messages", labelnames=["device"])
@@ -181,19 +186,17 @@ class Worker:
         time.sleep(self.collecting_interval_seconds)
         while True:
             queue_size = self.message_queue.qsize()
-            if queue_size > 0:
-                log.info(f"Processing {queue_size} event(s) from the message queue")
-                self.online.labels(device=self.device_name).set(1)
+            if queue_size:
+                log.info("Processing %s event(s) from the message queue", queue_size)
                 self.mqtt_messages_receive_total.labels(device=self.device_name).inc(queue_size)
-            else:
-                log.info("Message queue is empty. Assuming that the device is offline")
-                self.online.labels(device=self.device_name).set(0)
-                # Clear metrics for NaN (No data) instead of last value
+            while not self.message_queue.empty():
+                if self.process_message(self.message_queue.get()):
+                    self.last_valid_message = time.monotonic()
+            online = self.last_valid_message is not None and time.monotonic() - self.last_valid_message < self.offline_timeout
+            self.online.labels(device=self.device_name).set(int(online))
+            if not online:
                 for metric in self.metrics_collector:
                     metric.clear()
-
-            while not self.message_queue.empty():
-                self.process_message(self.message_queue.get())
 
             time.sleep(self.collecting_interval_seconds)
 
@@ -201,12 +204,22 @@ class Worker:
         try:
             message = json.loads(payload)
         except (ValueError, TypeError, UnicodeError):
-            log.warning("Skipping malformed MQTT JSON")
-            return
+            if self.device_model == "delta3_plus" and isinstance(payload, bytes):
+                try:
+                    reports = decode_delta3(payload)
+                except DecodeError as error:
+                    log.warning("Skipping invalid DELTA 3 Plus packet: %s", error)
+                    return False
+                for report in reports:
+                    self.process_payload(report, "", "")
+                return bool(reports)
+            log.warning("Skipping non-JSON MQTT message (DEVICE_MODEL=%s)", self.device_model)
+            return False
         if not isinstance(message, dict) or not isinstance(message.get("params"), dict):
             log.warning("Skipping MQTT message without a params object")
             return
         self.process_payload(message["params"], "", "")
+        return True
 
     def get_metric_by_ecoflow_payload_key(self, ecoflow_payload_key):
         for metric in self.metrics_collector:
@@ -289,10 +302,11 @@ def main():
     try:
         exporter_port = int(os.getenv("EXPORTER_PORT", "9090"))
         collecting_interval_seconds = int(os.getenv("COLLECTING_INTERVAL", "10"))
-        if not 1 <= exporter_port <= 65535 or collecting_interval_seconds <= 0:
+        offline_timeout = int(os.getenv("OFFLINE_TIMEOUT", "120"))
+        if not 1 <= exporter_port <= 65535 or collecting_interval_seconds <= 0 or offline_timeout <= 0:
             raise ValueError
     except ValueError:
-        log.error("EXPORTER_PORT must be 1..65535 and COLLECTING_INTERVAL a positive integer")
+        log.error("EXPORTER_PORT must be 1..65535 and COLLECTING_INTERVAL/OFFLINE_TIMEOUT positive integers")
         sys.exit(1)
 
     if (not device_sn or not ecoflow_username or not ecoflow_password):
@@ -309,7 +323,8 @@ def main():
 
     connection = EcoflowMQTT(message_queue, device_sn, auth.mqtt_username, auth.mqtt_password, auth.mqtt_url, auth.mqtt_port, auth.mqtt_client_id)
 
-    metrics = Worker(message_queue, device_name, collecting_interval_seconds)
+    metrics = Worker(message_queue, device_name, collecting_interval_seconds,
+                     device_model=os.getenv("DEVICE_MODEL", "json"), offline_timeout=offline_timeout)
 
     try:
         start_http_server(exporter_port)
